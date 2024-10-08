@@ -3,32 +3,38 @@ use strict;
 use warnings;
 use List::Util qw[min max];
 
-# IBM x3650 Port notes: This port was made in an attempt to quiet down an IBM system x3650 M4.
-# The script has been modified to include temperature averaging, hysteresis, and improved error handling.
-
 # System Configuration
 my $hostname = `hostname`;
 $hostname =~ s/\n//g;  # Remove line ending from hostname
 
 my $number_of_fanbanks = 2;  # Number of banks of fans to update
-my $min_temp_change = 2;  # Minimum temperature change required to trigger a fan update
-my $seconds_to_sleep = 10;  # Number of seconds to sleep between update loops
-my $hysteresis = 2;  # Degrees Celsius for hysteresis to prevent rapid changes
+my $min_temp_change = 1;  # Minimum temperature change to trigger an update
+my $seconds_to_sleep = 5;  # Sleep duration between checks
+my $hysteresis = 1;  # Hysteresis to prevent rapid changes
+my $max_fan_speed_change = 5;  # Max change per update cycle
+my $min_fan_speed = 10;  # Minimum fan speed percentage
+my $max_fan_speed = 100;  # Maximum fan speed percentage
 
 # IPMI Configuration
 my $ipmi_preamble = "ipmitool";
 
 # CPU Temp -> Fan Speed Mappings
 my %cpu_temp_to_fan_speed = (
-    80 => 100,
-    70 => 80,
-    60 => 30,
+    30 => 10,
+    35 => 12,
+    40 => 15,
+    45 => 17,
     50 => 20,
-    10 => 15,
+    55 => 30,
+    60 => 40,
+    65 => 50,
+    70 => 70,
+    75 => 85,
+    80 => 100,
 );
 
 my %cpu_temp_scale;
-my $g_current_fan_duty_cycle = 0;
+my $g_current_fan_duty_cycle = $min_fan_speed;
 my $g_current_cpu_temp = 0;
 my $g_last_set_cpu_temp = 0;
 
@@ -36,9 +42,11 @@ my $g_last_set_cpu_temp = 0;
 sub Internal_DoSetFanSpeed {
     my ($fan_speed) = @_;
 
-    # Sets the speed for each individual fan bank
+    # Ensure fan speed is within allowable range
+    $fan_speed = min(max($fan_speed, $min_fan_speed), $max_fan_speed);
+
     for (my $i = 1; $i <= $number_of_fanbanks; $i++) {
-        print "Setting FanBank n°$i speed at $fan_speed\n";
+        print "Setting FanBank #$i speed to $fan_speed%\n";
         `$ipmi_preamble raw 0x3a 0x07 $i $fan_speed 0x01 > /dev/null 2>&1`;
     }
 }
@@ -71,10 +79,10 @@ sub GetCPUTemp {
     return $current_cpu_temp;
 }
 
-# Calculate the scalar values for linear interpolation based on the temp-to-fan-speed mapping
+# Calculate the scalar values for linear interpolation
 sub CalculateScalars {
     my @previous = ();
-    foreach my $a (sort keys %cpu_temp_to_fan_speed) {
+    foreach my $a (sort { $a <=> $b } keys %cpu_temp_to_fan_speed) {
         my @current = ($a, $cpu_temp_to_fan_speed{$a});
 
         if (@previous) {
@@ -88,38 +96,55 @@ sub CalculateScalars {
     }
 }
 
-# Update the fan speed based on the current CPU temperature with hysteresis
+# Update the fan speed with hysteresis and smoothing
 sub UpdateFanSpeed {
     my $current_cpu_temp = GetAverageCPUTemp();
     $g_current_cpu_temp = $current_cpu_temp;
 
-    print "Maximum CPU Temperature Seen: $current_cpu_temp degrees C.\n";
+    print "Average CPU Temperature: $current_cpu_temp°C\n";
 
-    my $desired_fan_speed = 0;
-    my $calculated_speed = 0;
-    foreach my $a (reverse sort keys %cpu_temp_scale) {
-        if ($current_cpu_temp <= $a - $hysteresis) {
+    my $desired_fan_speed = $min_fan_speed;
+    my $calculated_speed = $min_fan_speed;
+
+    foreach my $a (reverse sort { $a <=> $b } keys %cpu_temp_scale) {
+        if ($current_cpu_temp >= $a - $hysteresis) {
             my @formula = @{$cpu_temp_scale{$a}};
             $calculated_speed = ($formula[0] * $current_cpu_temp) + $formula[1];
             $desired_fan_speed = sprintf("%.0f", $calculated_speed);
+            last;
         }
     }
+
+    # Ensure desired fan speed is within allowable range
+    $desired_fan_speed = min(max($desired_fan_speed, $min_fan_speed), $max_fan_speed);
 
     print "Current Fan Duty Cycle: $g_current_fan_duty_cycle%\n";
     print "Desired Fan Duty Cycle: $desired_fan_speed%\n";
 
+    # Smooth fan speed changes
+    if (abs($desired_fan_speed - $g_current_fan_duty_cycle) > $max_fan_speed_change) {
+        if ($desired_fan_speed > $g_current_fan_duty_cycle) {
+            $desired_fan_speed = $g_current_fan_duty_cycle + $max_fan_speed_change;
+        } else {
+            $desired_fan_speed = $g_current_fan_duty_cycle - $max_fan_speed_change;
+        }
+    }
+
     # Output metrics to monitor fan speed
-    my $speed_raw = sprintf("%x", $calculated_speed);
+    my $speed_raw = sprintf("%x", $desired_fan_speed);
     open(my $fh, '>', '/tmp/fan_speed_telegraf') or die $!;
-    print $fh "fans,host=$hostname speed_percent=$calculated_speed\n";
+    print $fh "fans,host=$hostname speed_percent=$desired_fan_speed\n";
     print $fh "fans,host=$hostname speed_raw=$speed_raw\n";
     close($fh);
 
     # Set the fan speed if there's a significant change
-    SetFanSpeed($desired_fan_speed) if abs($g_current_cpu_temp - $g_last_set_cpu_temp) > $min_temp_change;
+    if (abs($g_current_cpu_temp - $g_last_set_cpu_temp) > $min_temp_change ||
+        abs($desired_fan_speed - $g_current_fan_duty_cycle) >= $max_fan_speed_change) {
+        SetFanSpeed($desired_fan_speed);
+    }
 }
 
-# Set the fan speed if conditions are met
+# Set the fan speed
 sub SetFanSpeed {
     my ($fan_speed) = @_;
     $g_last_set_cpu_temp = $g_current_cpu_temp;
@@ -133,11 +158,11 @@ CalculateScalars();
 
 while (1) {
     print "\n=================================================================\n";
-    print "Calling UpdateFanSpeed()...\n";
+    print "Updating Fan Speed...\n";
     print "=================================================================\n";
     UpdateFanSpeed();
     print "=================================================================\n";
-    print "Update Complete - going to sleep for $seconds_to_sleep seconds...\n";
+    print "Sleeping for $seconds_to_sleep seconds...\n";
     print "=================================================================\n";
     sleep $seconds_to_sleep;
 }
