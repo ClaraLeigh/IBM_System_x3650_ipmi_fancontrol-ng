@@ -137,17 +137,20 @@ sub UpdateFanSpeed {
     print $fh "fans,host=$hostname speed_raw=$speed_raw\n";
     close($fh);
 
-    # Set the fan speed if there's a significant change
-    if (abs($g_current_cpu_temp - $g_last_set_cpu_temp) > $min_temp_change ||
-        abs($desired_fan_speed - $g_current_fan_duty_cycle) >= $max_fan_speed_change) {
+    # Set the fan speed only if it has changed
+    if ($desired_fan_speed != $g_current_fan_duty_cycle) {
         SetFanSpeed($desired_fan_speed);
+    } else {
+        print "Fan speed unchanged. No action taken.\n";
     }
+
+    # Update last CPU temp for reference (if needed elsewhere)
+    $g_last_set_cpu_temp = $g_current_cpu_temp;
 }
 
 # Set the fan speed
 sub SetFanSpeed {
     my ($fan_speed) = @_;
-    $g_last_set_cpu_temp = $g_current_cpu_temp;
     $g_current_fan_duty_cycle = $fan_speed;
     Internal_DoSetFanSpeed($fan_speed);
 }
@@ -158,7 +161,7 @@ CalculateScalars();
 
 while (1) {
     print "\n=================================================================\n";
-    print "Updating Fan Speed...\n";
+    print "Running Fan Speed check...\n";
     print "=================================================================\n";
     UpdateFanSpeed();
     print "=================================================================\n";
